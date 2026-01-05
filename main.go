@@ -11,6 +11,7 @@ import (
 	"time"
 )
 
+// LogEntry は一つのリクエスト/レスポンスログを保持する構造体
 type LogEntry struct {
 	ID          int64  `json:"id"`
 	Timestamp   string `json:"timestamp"`
@@ -27,8 +28,9 @@ var (
 	maxLogs    = 50
 )
 
+// buildRawRequest はリクエストをHTTP生データ風の文字列に整形する
 func buildRawRequest(r *http.Request, body []byte) string {
-	raw := fmt.Sprintf("%s %s %s\n", r.Method, r.URL.RequestURI(), r.Proto)
+	raw := fmt.Sprintf("%s %s %s\n", r.Method, r.RequestURI, r.Proto)
 	for name, values := range r.Header {
 		for _, value := range values {
 			raw += fmt.Sprintf("%s: %s\n", name, value)
@@ -41,45 +43,79 @@ func buildRawRequest(r *http.Request, body []byte) string {
 	return raw
 }
 
+// buildRawResponse はレスポンスをHTTP生データ風の文字列に整形する
+func buildRawResponse(body string) string {
+	dateStr := time.Now().UTC().Format(http.TimeFormat)
+	return fmt.Sprintf("HTTP/1.1 200 OK\nDate: %s\nContent-Type: text/plain; charset=utf-8\n\n%s", dateStr, body)
+}
+
 func main() {
+	// 管理用エンドポイント
 	http.HandleFunc("/admin", handleAdmin)
 	http.HandleFunc("/admin/clear", handleClear)
-	
+
+	// メインロジック（/ および /log）
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/admin" || r.URL.Path == "/admin/clear" {
+		// 1. 不要なブラウザ自動リクエストを除外
+		if r.URL.Path == "/favicon.ico" {
+			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		body, _ := io.ReadAll(r.Body)
-		entry := LogEntry{
-			ID:         time.Now().UnixNano(),
-			Timestamp:  time.Now().Format("2006-01-02 15:04:05"),
-			IP:         r.RemoteAddr,
-			Method:     r.Method,
-			URL:        r.URL.String(),
-			RawRequest: buildRawRequest(r, body),
-			RawResponse: "HTTP/1.1 200 OK\nDate: " + time.Now().UTC().Format(http.TimeFormat) + "\nContent-Type: text/plain\n\nLogged",
+
+		// 2. パスによってレスポンス内容を決定（Node.js版の再現）
+		var responseBody string
+		if r.URL.Path == "/" {
+			responseBody = "Active"
+		} else if r.URL.Path == "/log" {
+			responseBody = "Logged"
+		} else {
+			// /admin系以外で、上記以外のパスは404としてログにも残さない
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, "404 Not Found")
+			return
 		}
+
+		// 3. リクエストボディの読み取り
+		reqBody, _ := io.ReadAll(r.Body)
+
+		// 4. ログエントリーの作成（実際のレスポンスと同期させる）
+		entry := LogEntry{
+			ID:          time.Now().UnixNano(),
+			Timestamp:   time.Now().Format("2006-01-02 15:04:05"),
+			IP:          r.RemoteAddr,
+			Method:      r.Method,
+			URL:         r.RequestURI,
+			RawRequest:  buildRawRequest(r, reqBody),
+			RawResponse: buildRawResponse(responseBody),
+		}
+
+		// 5. スレッドセーフにログを保存
 		mutex.Lock()
 		accessLogs = append([]LogEntry{entry}, accessLogs...)
 		if len(accessLogs) > maxLogs {
 			accessLogs = accessLogs[:maxLogs]
 		}
 		mutex.Unlock()
+
+		// 6. 実際のレスポンスを返す
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Logged"))
+		w.Write([]byte(responseBody))
 	})
 
-	fmt.Println("URL: http://localhost:3001/admin")
+	fmt.Println("Server started at http://localhost:3001/admin")
 	http.ListenAndServe(":3001", nil)
 }
 
+// --- ハンドラー関数 ---
+
 func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	mutex.Lock()
-	// 全ログをJSON化してBase64にする（一括保存ボタン用）
+	defer mutex.Unlock()
+
 	allLogsJson, _ := json.Marshal(accessLogs)
 	allLogsBase64 := base64.StdEncoding.EncodeToString(allLogsJson)
-	
-	// テンプレートに渡すデータ
+
 	data := struct {
 		Logs          []LogEntry
 		AllLogsBase64 string
@@ -87,7 +123,6 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 		Logs:          accessLogs,
 		AllLogsBase64: allLogsBase64,
 	}
-	mutex.Unlock()
 
 	t := template.Must(template.New("admin").Funcs(template.FuncMap{
 		"base64": func(s string) string {
@@ -104,7 +139,8 @@ func handleClear(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
 }
 
-// 元のHTMLレイアウトをGoのテンプレート構文に移植
+// --- HTMLテンプレート ---
+
 const htmlTemplate = `
 <!DOCTYPE html>
 <html>
