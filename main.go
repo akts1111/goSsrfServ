@@ -16,6 +16,7 @@ import (
 type LogEntry struct {
 	ID          int64  `json:"id"`
 	Timestamp   string `json:"timestamp"`
+	FilenameTS  string `json:"filename_ts"`
 	IP          string `json:"ip"`
 	RawRequest  string `json:"rawRequest"`
 	RawResponse string `json:"rawResponse"`
@@ -64,9 +65,11 @@ func main() {
 		rawResponse := respHeader + responseBody
 
 		// ログエントリー作成
+		now := time.Now()
 		entry := LogEntry{
-			ID:          time.Now().UnixNano(),
-			Timestamp:   time.Now().Format("2006-01-02 15:04:05"),
+			ID:          now.UnixNano(),
+			Timestamp:   now.Format("2006-01-02 15:04:05"),
+			FilenameTS:  now.Format("20060102_150405"),
 			IP:          r.RemoteAddr,
 			RawRequest:  string(requestDump),
 			RawResponse: rawResponse,
@@ -157,10 +160,10 @@ const htmlTemplate = `
             <div class="card">
                 <div class="card-header">
                     <span><strong>[{{.Timestamp}}]</strong> From: {{.IP}}</span>
-                    <button style="background:#f8f9fa; border:1px solid #ccc; font-size:11px;"
-                        onclick="downloadSingle('{{base64 (printf "=== REQUEST ===\n%s\n\n=== RESPONSE ===\n%s" .RawRequest .RawResponse)}}', 'log_{{.ID}}.txt')">
-                        保存 (.txt)
-                    </button>
+					<button style="background:#f8f9fa; border:1px solid #ccc; font-size:11px;"
+						onclick="downloadSingle('{{base64 (printf "=== REQUEST ===\n%s\n\n=== RESPONSE ===\n%s" .RawRequest .RawResponse)}}', 'log_{{.FilenameTS}}.txt')">
+						保存 (.txt)
+					</button>
                 </div>
                 <div class="log-grid">
                     <div>
