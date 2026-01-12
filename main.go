@@ -6,27 +6,29 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
+	"net"
 	"net/http"
 	"net/http/httputil"
+	"strings"
 	"sync"
 	"time"
 )
 
-// LogEntry は一つのリクエスト/レスポンスログを保持
+// ログ構造体 (Rust版とフィールドを統一)
 type LogEntry struct {
 	ID          int64  `json:"id"`
 	Timestamp   string `json:"timestamp"`
 	FilenameTS  string `json:"filename_ts"`
 	IP          string `json:"ip"`
-	RawRequest  string `json:"rawRequest"`
-	RawResponse string `json:"rawResponse"`
+	RawRequest  string `json:"raw_request"`
+	RawResponse string `json:"raw_response"`
 }
 
 var (
 	accessLogs []LogEntry
 	mutex      sync.RWMutex
-	maxLogs    = 50
-	// テンプレートの事前コンパイル（効率化）
+	maxLogs    int
+	// テンプレートの事前コンパイル
 	tmpl = template.Must(template.New("admin").Funcs(template.FuncMap{
 		"base64": func(s string) string {
 			return base64.StdEncoding.EncodeToString([]byte(s))
@@ -35,68 +37,82 @@ var (
 )
 
 func main() {
-	// 1. ポート番号の外部指定 (-p 3001)
+	// コマンドライン引数 (Rust版 Args と同様)
 	port := flag.String("p", "3001", "Port to listen on")
+	limit := flag.Int("limit", 50, "Maximum number of logs to keep")
 	flag.Parse()
+	maxLogs = *limit
 
 	http.HandleFunc("/admin", handleAdmin)
 	http.HandleFunc("/admin/clear", handleClear)
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/favicon.ico" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
+	// Fallback (handle_all)
+	http.HandleFunc("/", handleAll)
 
-		// --- リクエストの生データをキャプチャ ---
-		// trueを渡すとボディもキャプチャする
-		requestDump, _ := httputil.DumpRequest(r, true)
-
-		// レスポンスの決定
-		responseBody := "Active"
-		if r.URL.Path == "/log" {
-			responseBody = "Logged"
-		}
-
-		// --- レスポンスの生データを構築 ---
-		// 実際に送信されるヘッダーに近い形式で保存
-		respHeader := fmt.Sprintf("HTTP/1.1 200 OK\nDate: %s\nContent-Type: text/plain; charset=utf-8\nContent-Length: %d\n\n",
-			time.Now().UTC().Format(http.TimeFormat), len(responseBody))
-		rawResponse := respHeader + responseBody
-
-		// ログエントリー作成
-		now := time.Now()
-		entry := LogEntry{
-			ID:          now.UnixNano(),
-			Timestamp:   now.Format("2006-01-02 15:04:05"),
-			FilenameTS:  now.Format("20060102_150405"),
-			IP:          r.RemoteAddr,
-			RawRequest:  string(requestDump),
-			RawResponse: rawResponse,
-		}
-
-		// ログ保存
-		mutex.Lock()
-		accessLogs = append([]LogEntry{entry}, accessLogs...)
-		if len(accessLogs) > maxLogs {
-			accessLogs = accessLogs[:maxLogs]
-		}
-		mutex.Unlock()
-
-		// 実際のレスポンス送信
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Write([]byte(responseBody))
-	})
-
-	fmt.Printf("Server started at http://localhost:%s/admin\n", *port)
-	http.ListenAndServe(":"+*port, nil)
+	fmt.Printf("SSRF Monitor (Go) started at http://localhost:%s/admin\n", *port)
+	if err := http.ListenAndServe(":"+*port, nil); err != nil {
+		fmt.Printf("Error: %v\n", err)
+	}
 }
 
-// --- ハンドラー関数 ---
+func handleAll(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/favicon.ico" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	// IP判定ロジック (X-Forwarded-For 優先)
+	clientIP := r.Header.Get("X-Forwarded-For")
+	if clientIP != "" {
+		clientIP = strings.TrimSpace(strings.Split(clientIP, ",")[0])
+	} else {
+		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		clientIP = ip
+	}
+
+	// 応答の決定
+	responseBody := "Active"
+	if r.URL.Path == "/log" {
+		responseBody = "Logged"
+	} else if r.URL.Path != "/" {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, "404 Not Found")
+		return
+	}
+
+	// 生リクエストのキャプチャ (Go特有の便利な関数を使用)
+	requestDump, _ := httputil.DumpRequest(r, true)
+
+	// 生レスポンスの構築
+	dateStr := time.Now().UTC().Format(http.TimeFormat)
+	rawResponse := fmt.Sprintf("HTTP/1.1 200 OK\nDate: %s\nContent-Type: text/plain; charset=utf-8\nContent-Length: %d\n\n%s",
+		dateStr, len(responseBody), responseBody)
+
+	// ログの保存
+	now := time.Now()
+	entry := LogEntry{
+		ID:          now.UnixNano(),
+		Timestamp:   now.Format("2006-01-02 15:04:05"),
+		FilenameTS:  now.Format("20060102_150405"),
+		IP:          clientIP,
+		RawRequest:  string(requestDump),
+		RawResponse: rawResponse,
+	}
+
+	mutex.Lock()
+	accessLogs = append([]LogEntry{entry}, accessLogs...)
+	if len(accessLogs) > maxLogs {
+		accessLogs = accessLogs[:maxLogs]
+	}
+	mutex.Unlock()
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(responseBody))
+}
 
 func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	mutex.RLock()
-	// JSONダウンロード用にスライスをコピー
 	logsCopy := make([]LogEntry, len(accessLogs))
 	copy(logsCopy, accessLogs)
 	mutex.RUnlock()
@@ -123,77 +139,77 @@ func handleClear(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
 }
 
-// --- HTMLテンプレート (スタイル微調整) ---
+// HTMLテンプレート (Rust版と完全に同一)
 const htmlTemplate = `
 <!DOCTYPE html>
-<html>
+<html lang="ja">
 <head>
     <title>SSRF Monitor (Go)</title>
     <meta charset="utf-8">
     <style>
-        body { font-family: sans-serif; background: #f4f7f6; padding: 20px; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f0f2f5; padding: 20px; color: #1c1e21; }
         .container { max-width: 1200px; margin: 0 auto; }
-        .header { background: white; padding: 20px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-        .card { background: white; border-radius: 8px; margin-bottom: 20px; padding: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border-left: 5px solid #007bff; }
-        .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; font-size: 0.9em; color: #555; }
-        .log-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
-        pre { background: #2d2d2d; color: #f8f8f2; padding: 12px; font-size: 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; margin: 0; border-radius: 4px; border: 1px solid #111; line-height: 1.4; }
-        .res-pre { color: #a6e22e; }
-        button { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
-        .btn-green { background: #28a745; color: white; }
-        .btn-blue { background: #007bff; color: white; }
-        .btn-grey { background: #6c757d; color: white; }
+        .header { background: #fff; padding: 20px; border-radius: 12px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+        .card { background: #fff; border-radius: 12px; margin-bottom: 20px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); border-left: 6px solid #007bff; }
+        .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; border-bottom: 1px solid #eee; padding-bottom: 10px; }
+        .log-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        pre { background: #1e1e1e; color: #d4d4d4; padding: 15px; font-size: 13px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; margin: 0; border-radius: 8px; line-height: 1.5; }
+        .res-pre { color: #9cdcfe; }
+        .label { font-size: 12px; font-weight: bold; color: #65676b; margin-bottom: 8px; text-transform: uppercase; }
+        button { padding: 10px 18px; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; transition: opacity 0.2s; }
+        button:hover { opacity: 0.8; }
+        .btn-green { background: #42b72a; color: white; }
+        .btn-blue { background: #1877f2; color: white; }
+        .btn-grey { background: #ebedf0; color: #4b4f56; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1 style="margin:0;">SSRF Monitor (Go)</h1>
-            <div>
+            <h1 style="margin:0; font-size: 24px;">SSRF Monitor (Go)</h1>
+            <div style="display: flex; gap: 10px;">
                 <button class="btn-green" onclick="location.reload()">更新</button>
-                <button class="btn-blue" onclick="downloadAll()">全ログ一括保存 (.json)</button>
-                <button class="btn-grey" onclick="fetch('/admin/clear').then(()=>location.reload())">クリア</button>
+                <button class="btn-blue" onclick="downloadAll()">全ログDL (.json)</button>
+                <button class="btn-grey" onclick="confirmClear()">クリア</button>
             </div>
         </div>
         <div>
             {{range .Logs}}
             <div class="card">
                 <div class="card-header">
-                    <span><strong>[{{.Timestamp}}]</strong> From: {{.IP}}</span>
-					<button style="background:#f8f9fa; border:1px solid #ccc; font-size:11px;"
-						onclick="downloadSingle('{{base64 (printf "=== REQUEST ===\n%s\n\n=== RESPONSE ===\n%s" .RawRequest .RawResponse)}}', 'log_{{.FilenameTS}}.txt')">
-						保存 (.txt)
-					</button>
+                    <span><strong style="color:#007bff;">[{{.Timestamp}}]</strong> From: {{.IP}}</span>
+                    <button style="background:#f0f2f5; border:1px solid #ddd; font-size:12px; padding: 5px 10px;"
+                        onclick="downloadSingle('{{base64 (printf "=== REQUEST ===\n%s\n\n=== RESPONSE ===\n%s" .RawRequest .RawResponse)}}', 'log_{{.FilenameTS}}.txt')">
+                        保存
+                    </button>
                 </div>
                 <div class="log-grid">
-                    <div>
-                        <div style="font-size:11px; color:#666; margin-bottom:4px;">REQUEST</div>
-                        <pre>{{.RawRequest}}</pre>
-                    </div>
-                    <div>
-                        <div style="font-size:11px; color:#666; margin-bottom:4px;">RESPONSE</div>
-                        <pre class="res-pre">{{.RawResponse}}</pre>
-                    </div>
+                    <div><div class="label">Request</div><pre>{{.RawRequest}}</pre></div>
+                    <div><div class="label">Response</div><pre class="res-pre">{{.RawResponse}}</pre></div>
                 </div>
             </div>
             {{else}}
-            <p style="text-align:center; color:#999; margin-top:50px;">ログ待機中... ({{.Logs | len}} 件)</p>
+            <div style="text-align:center; padding: 100px; background: white; border-radius: 12px; color: #999;">
+                <h3>リクエスト待機中...</h3>
+            </div>
             {{end}}
         </div>
     </div>
-
     <script>
-        function downloadFile(contentBase64, fileName, contentType) {
-            const binary = atob(contentBase64);
-            const array = new Uint8Array(binary.length);
-            for(let i=0; i<binary.length; i++) array[i] = binary.charCodeAt(i);
-            const file = new Blob([array], {type: contentType});
-            const a = document.createElement("a");
-            a.href = URL.createObjectURL(file);
-            a.download = fileName;
-            a.click();
+        function confirmClear() {
+            if(confirm("全てのログを削除しますか？")) {
+                fetch('/admin/clear').then(() => location.reload());
+            }
         }
-        function downloadSingle(base64Data, name) { downloadFile(base64Data, name, "text/plain"); }
+        function downloadFile(b64, name, type) {
+            const bin = atob(b64);
+            const buf = new Uint8Array(bin.length);
+            for(let i=0; i<bin.length; i++) buf[i] = bin.charCodeAt(i);
+            const a = document.createElement("a");
+            a.href = URL.createObjectURL(new Blob([buf], {type}));
+            a.download = name; a.click();
+        }
+        function downloadSingle(data, name) { downloadFile(data, name, "text/plain"); }
         function downloadAll() { downloadFile("{{.AllLogsBase64}}", "ssrf_all_logs.json", "application/json"); }
     </script>
 </body>
