@@ -14,7 +14,6 @@ import (
 	"time"
 )
 
-// ログ構造体 (Rust版とフィールドを統一)
 type LogEntry struct {
 	ID          int64  `json:"id"`
 	Timestamp   string `json:"timestamp"`
@@ -25,11 +24,11 @@ type LogEntry struct {
 }
 
 var (
-	accessLogs []LogEntry
-	mutex      sync.RWMutex
-	maxLogs    int
-	// テンプレートの事前コンパイル
-	tmpl = template.Must(template.New("admin").Funcs(template.FuncMap{
+	accessLogs   []LogEntry
+	mutex        sync.RWMutex
+	maxLogs      int
+	serverDomain string // 追加：サーバーのドメイン保持用
+	tmpl         = template.Must(template.New("admin").Funcs(template.FuncMap{
 		"base64": func(s string) string {
 			return base64.StdEncoding.EncodeToString([]byte(s))
 		},
@@ -37,19 +36,31 @@ var (
 )
 
 func main() {
-	// コマンドライン引数 (Rust版 Args と同様)
 	port := flag.String("p", "3001", "Port to listen on")
 	limit := flag.Int("limit", 50, "Maximum number of logs to keep")
+	domain := flag.String("d", "", "Domain name (e.g., example.com)") // 追加
 	flag.Parse()
+
 	maxLogs = *limit
+
+	// ドメインの設定（未指定なら localhost:port）
+	if *domain == "" {
+		serverDomain = fmt.Sprintf("localhost:%s", *port)
+	} else {
+		serverDomain = *domain
+	}
 
 	http.HandleFunc("/admin", handleAdmin)
 	http.HandleFunc("/admin/clear", handleClear)
-
-	// Fallback (handle_all)
 	http.HandleFunc("/", handleAll)
 
-	fmt.Printf("SSRF Monitor (Go) started at http://localhost:%s/admin\n", *port)
+	// コンソール表示も動的に変更
+	fmt.Printf("==========================================\n")
+	fmt.Printf(" SSRF Monitor (Go) Running\n")
+	fmt.Printf(" Domain: %s\n", serverDomain)
+	fmt.Printf(" Admin URL: http://%s/admin\n", serverDomain)
+	fmt.Printf("==========================================\n")
+
 	if err := http.ListenAndServe(":"+*port, nil); err != nil {
 		fmt.Printf("Error: %v\n", err)
 	}
@@ -61,7 +72,6 @@ func handleAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// IP判定ロジック (X-Forwarded-For 優先)
 	clientIP := r.Header.Get("X-Forwarded-For")
 	if clientIP != "" {
 		clientIP = strings.TrimSpace(strings.Split(clientIP, ",")[0])
@@ -70,7 +80,6 @@ func handleAll(w http.ResponseWriter, r *http.Request) {
 		clientIP = ip
 	}
 
-	// 応答の決定
 	responseBody := "Active"
 	if r.URL.Path == "/log" {
 		responseBody = "Logged"
@@ -80,15 +89,11 @@ func handleAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 生リクエストのキャプチャ (Go特有の便利な関数を使用)
 	requestDump, _ := httputil.DumpRequest(r, true)
-
-	// 生レスポンスの構築
 	dateStr := time.Now().UTC().Format(http.TimeFormat)
 	rawResponse := fmt.Sprintf("HTTP/1.1 200 OK\nDate: %s\nContent-Type: text/plain; charset=utf-8\nContent-Length: %d\n\n%s",
 		dateStr, len(responseBody), responseBody)
 
-	// ログの保存
 	now := time.Now()
 	entry := LogEntry{
 		ID:          now.UnixNano(),
@@ -123,9 +128,11 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	data := struct {
 		Logs          []LogEntry
 		AllLogsBase64 string
+		Domain        string // テンプレートにドメインを渡す
 	}{
 		Logs:          logsCopy,
 		AllLogsBase64: allLogsBase64,
+		Domain:        serverDomain,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -139,12 +146,11 @@ func handleClear(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
 }
 
-// HTMLテンプレート (Rust版と完全に同一)
 const htmlTemplate = `
 <!DOCTYPE html>
 <html lang="ja">
 <head>
-    <title>SSRF Monitor (Go)</title>
+    <title>SSRF Monitor - {{.Domain}}</title>
     <meta charset="utf-8">
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f0f2f5; padding: 20px; color: #1c1e21; }
@@ -161,12 +167,16 @@ const htmlTemplate = `
         .btn-green { background: #42b72a; color: white; }
         .btn-blue { background: #1877f2; color: white; }
         .btn-grey { background: #ebedf0; color: #4b4f56; }
+        .sub-title { font-size: 14px; color: #65676b; font-weight: normal; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1 style="margin:0; font-size: 24px;">SSRF Monitor (Go)</h1>
+            <div>
+                <h1 style="margin:0; font-size: 24px;">SSRF Monitor</h1>
+                <div class="sub-title">Running on: <strong>{{.Domain}}</strong></div>
+            </div>
             <div style="display: flex; gap: 10px;">
                 <button class="btn-green" onclick="location.reload()">更新</button>
                 <button class="btn-blue" onclick="downloadAll()">全ログDL (.json)</button>
@@ -179,7 +189,7 @@ const htmlTemplate = `
                 <div class="card-header">
                     <span><strong style="color:#007bff;">[{{.Timestamp}}]</strong> From: {{.IP}}</span>
                     <button style="background:#f0f2f5; border:1px solid #ddd; font-size:12px; padding: 5px 10px;"
-                        onclick="downloadSingle('{{base64 (printf "=== REQUEST ===\n%s\n\n=== RESPONSE ===\n%s" .RawRequest .RawResponse)}}', 'log_{{.FilenameTS}}.txt')">
+                        onclick="downloadSingle('{{base64 (printf "=== REQUEST ===\n%s\n\n=== RESPONSE ===\n%s" .RawRequest .RawResponse)}}', '{{$.Domain}}_{{.FilenameTS}}.txt')">
                         保存
                     </button>
                 </div>
@@ -190,7 +200,7 @@ const htmlTemplate = `
             </div>
             {{else}}
             <div style="text-align:center; padding: 100px; background: white; border-radius: 12px; color: #999;">
-                <h3>リクエスト待機中...</h3>
+                <h3>リクエスト待機中... ({{.Domain}})</h3>
             </div>
             {{end}}
         </div>
@@ -210,7 +220,7 @@ const htmlTemplate = `
             a.download = name; a.click();
         }
         function downloadSingle(data, name) { downloadFile(data, name, "text/plain"); }
-        function downloadAll() { downloadFile("{{.AllLogsBase64}}", "ssrf_all_logs.json", "application/json"); }
+        function downloadAll() { downloadFile("{{.AllLogsBase64}}", "ssrf_logs_{{.Domain}}.json", "application/json"); }
     </script>
 </body>
 </html>
