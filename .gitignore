@@ -1,3 +1,4 @@
 ssrf-monitor
 *.exe
 .vscode/
+go-ssrf-server
